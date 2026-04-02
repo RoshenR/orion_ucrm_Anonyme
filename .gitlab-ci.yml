@@ -1,0 +1,33 @@
+stages:
+  - test
+  - build
+
+test-front:
+  image: cypress/browsers:latest
+  stage: test
+  script:
+    - cd front
+    - npm ci
+    - CHROME_BIN=/opt/google/chrome/chrome npx @angular/cli test --no-watch --no-progress --browsers=ChromeHeadlessNoSandbox
+
+test-back:
+  image: gradle:jdk17
+  stage: test
+  script:
+    - cd back
+    - ./gradlew test
+
+build-front:
+  image: node
+  stage: build
+  script:
+    - cd front
+    - npm ci
+    - npx @angular/cli build --optimization
+
+build-back:
+  image: gradle:jdk17
+  stage: build
+  script:
+    - cd back
+    - ./gradlew build

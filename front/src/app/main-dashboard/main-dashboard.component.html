@@ -1,0 +1,84 @@
+<div class="columns">
+  <div class="column">
+    <div class="level is-mobile">
+      <div class="level-left">
+        <h2 class="title is-size-2">Persons</h2>
+      </div>
+      <div class="level-right">
+        <a
+          class="button is-primary is-medium level-item"
+          [routerLink]="['persons/new']"
+        >
+          <span class="has-text-weight-bold">+</span>
+        </a>
+      </div>
+    </div>
+    <div class="table-container">
+      <table class="table is-fullwidth">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Email</th>
+            <th>Updated at</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let pers of persons; first as isFirst">
+            <td>
+              <a [routerLink]="['persons', pers.id]"
+                >{{ pers.firstName }} {{ pers.lastName }}</a
+              >
+            </td>
+            <td>{{ pers.email }}</td>
+            <td>{{ pers.updatedAt | date }}</td>
+          </tr>
+          <tr *ngIf="persons.length === 0">
+            <td colspan="3" class="has-text-centered is-italic">
+              No person yet.
+              <a [routerLink]="['persons/new']">Create one</a>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="column">
+    <div class="level is-mobile">
+      <div class="level-left">
+        <h2 class="title is-size-2">Organizations</h2>
+      </div>
+      <div class="level-right">
+        <a
+          class="button is-primary is-medium level-item"
+          [routerLink]="['organizations/new']"
+        >
+          <span class="has-text-weight-bold">+</span>
+        </a>
+      </div>
+    </div>
+    <div class="table-container">
+      <table class="table is-fullwidth">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Updated at</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let org of organizations">
+            <td>
+              <a [routerLink]="['organizations', org.id]">{{ org.name }}</a>
+            </td>
+            <td>{{ org.updatedAt | date }}</td>
+          </tr>
+          <tr *ngIf="organizations.length === 0">
+            <td colspan="3" class="has-text-centered is-italic">
+              No organization yet.
+              <a [routerLink]="['organization/new']">Create one</a>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
