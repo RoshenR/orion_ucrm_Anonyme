@@ -61,6 +61,8 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
           cache: 'gradle'
+      - run: chmod +x ./gradlew
+        working-directory: back
       - run: ./gradlew spotbugsMain spotbugsTest --no-daemon
         working-directory: back
         env:
@@ -113,6 +115,8 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
           cache: 'gradle'
+      - run: chmod +x ./gradlew
+        working-directory: back
       - name: Tests avec JaCoCo
         run: ./gradlew test jacocoTestReport --no-daemon
         working-directory: back
