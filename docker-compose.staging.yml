@@ -1,0 +1,84 @@
+# ==============================================================================
+# DOCKER COMPOSE — ENVIRONNEMENT DE STAGING
+# ==============================================================================
+#
+# Usage :
+#   export REGISTRY_IMAGE=registry.gitlab.com/mon-groupe/orion-ucrm
+#   export IMAGE_TAG=abc1234   # ou un tag semver : v1.2.3
+#   docker compose -f docker-compose.staging.yml up -d
+#
+# Variables d'environnement requises :
+#   REGISTRY_IMAGE  → préfixe du registry GitLab (ex: registry.gitlab.com/org/repo)
+#   IMAGE_TAG       → tag des images à déployer (SHA court ou tag semver)
+#
+# Pour se connecter au registry GitLab avant de lancer :
+#   docker login registry.gitlab.com -u <user> -p <token>
+# ==============================================================================
+
+services:
+
+  # ── Backend : Spring Boot (JRE Alpine) ──────────────────────────────────────
+  backend:
+    image: ${REGISTRY_IMAGE}/backend:${IMAGE_TAG:-latest}
+    container_name: orion-backend
+    restart: unless-stopped
+    # Note : le Dockerfile expose le port 4200 (devrait être 8080 pour Spring Boot)
+    # Spring Boot démarre sur 8080 par défaut (application.properties).
+    # Adaptez le mapping si vous modifiez server.port dans application.properties.
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=staging
+      # Désactive le cache de schéma Hibernate en staging pour faciliter le debug
+      - SPRING_JPA_HIBERNATE_DDL_AUTO=update
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    networks:
+      - orion-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Frontend : Caddy + Angular dist ─────────────────────────────────────────
+  frontend:
+    image: ${REGISTRY_IMAGE}/frontend:${IMAGE_TAG:-latest}
+    container_name: orion-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - orion-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Standalone (optionnel) : tout-en-un via Supervisor ──────────────────────
+  # Décommentez ce bloc et commentez frontend+backend si vous préférez
+  # l'image tout-en-un pour simplifier le déploiement staging.
+  #
+  # standalone:
+  #   image: ${REGISTRY_IMAGE}/standalone:${IMAGE_TAG:-latest}
+  #   container_name: orion-standalone
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #     - "8080:4200"   # backend Spring Boot (EXPOSE 4200 dans Dockerfile)
+  #   networks:
+  #     - orion-net
+
+networks:
+  orion-net:
+    driver: bridge

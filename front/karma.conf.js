@@ -27,7 +27,14 @@ module.exports = function (config) {
     coverageReporter: {
       dir: require("path").join(__dirname, "./coverage/microcrm"),
       subdir: ".",
-      reporters: [{ type: "html" }, { type: "text-summary" }],
+      reporters: [
+        { type: "html" },
+        { type: "text-summary" },
+        // lcovonly : requis pour l'intégration GitLab CI (regex couverture)
+        { type: "lcovonly", file: "lcov.info" },
+        // cobertura : format natif supporté par l'onglet "Coverage" des MR GitLab
+        { type: "cobertura", file: "cobertura-coverage.xml" },
+      ],
     },
     reporters: ["progress", "kjhtml"],
     browsers: ["ChromeHeadlessNoSandbox", "ChromeHeadless", "Chrome"],

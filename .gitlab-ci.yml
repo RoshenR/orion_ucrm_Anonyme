@@ -1,33 +1,509 @@
+# ==============================================================================
+# PIPELINE CI/CD DEVSECOPS — ORION UCRM
+# ==============================================================================
+#
+# Architecture :
+#   - Frontend : Angular 17 (NPM + Karma/Jasmine + ESLint)
+#   - Backend  : Spring Boot 3.2 (Gradle + JUnit 5 + SpotBugs + JaCoCo)
+#   - Docker   : 3 images (frontend, backend, standalone)
+#   - Registry : GitLab Container Registry (interne, pas DockerHub)
+#
+# Stages :
+#   1. lint     → Analyse statique : ESLint (Angular) + SpotBugs (Java)
+#   2. test     → Tests unitaires : Karma (Angular) + JUnit 5 (Spring Boot)
+#   3. build    → Construction des 3 images Docker avec tag sémantique
+#   4. scan     → Scan CVE Trivy — BLOQUE si vulnérabilité CRITIQUE détectée
+#   5. publish  → Publication :latest + tag semver dans le registry interne
+#   6. deploy   → Déploiement staging via Docker Compose (branche main uniquement)
+#
+# Variables CI/CD à configurer dans GitLab (Settings → CI/CD → Variables) :
+#   STAGING_SSH_PRIVATE_KEY  → Clé SSH privée (type: File, Protected)
+#   STAGING_SSH_KNOWN_HOSTS  → Sortie de `ssh-keyscan <host>` (Protected)
+#   STAGING_USER             → Utilisateur SSH du serveur de staging
+#   STAGING_HOST             → Hostname ou IP du serveur de staging
+# ==============================================================================
+
 stages:
+  - lint
   - test
   - build
+  - scan
+  - publish
+  - deploy
 
-test-front:
+# ==============================================================================
+# VARIABLES GLOBALES
+# ==============================================================================
+variables:
+  # Registry GitLab Container Registry (fourni automatiquement par GitLab)
+  IMAGE_PREFIX: $CI_REGISTRY_IMAGE
+
+  # Gradle : désactive le daemon pour les builds CI (évite les locks)
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false"
+
+  # Trivy : paramètres globaux pour le scan CVE
+  TRIVY_NO_PROGRESS: "true"
+  TRIVY_CACHE_DIR: ".trivy-cache"
+
+  # Docker
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+
+# ==============================================================================
+# TEMPLATES DE CACHE (réutilisés via YAML anchors)
+# ==============================================================================
+
+# Cache Gradle — invalidé uniquement si build.gradle ou le wrapper change
+.gradle-cache: &gradle-cache
+  cache:
+    key:
+      prefix: gradle-v1
+      files:
+        - back/build.gradle
+        - back/gradle/wrapper/gradle-wrapper.properties
+    paths:
+      - back/.gradle/
+      - ~/.gradle/caches/
+
+# Cache NPM — invalidé uniquement si package-lock.json change
+.npm-cache: &npm-cache
+  cache:
+    key:
+      prefix: npm-v1
+      files:
+        - front/package-lock.json
+    paths:
+      - front/node_modules/
+
+# ==============================================================================
+# STAGE 1 — LINT
+# Analyse statique pour détecter les erreurs de code avant les tests
+# ==============================================================================
+
+# ── ESLint sur le code Angular/TypeScript ─────────────────────────────────────
+# Lit la configuration dans front/.eslintrc.json
+# Intègre @angular-eslint pour les règles spécifiques aux composants Angular
+lint-frontend:
+  stage: lint
+  image: node:20-alpine
+  <<: *npm-cache
+  script:
+    - cd front
+    - npm ci --prefer-offline --quiet
+    # Lint via Angular CLI — s'appuie sur la config "lint" dans angular.json
+    - npx ng lint --format=compact 2>&1 | tee ../lint-frontend.txt
+  artifacts:
+    name: "lint-frontend-$CI_COMMIT_SHORT_SHA"
+    when: always
+    expire_in: 7 days
+    paths:
+      - lint-frontend.txt
+  allow_failure: false
+
+# ── SpotBugs sur le code Java/Spring Boot ────────────────────────────────────
+# Détecte les bug patterns courants : NPE potentiels, mauvais equals(), etc.
+# Rapport HTML disponible dans les artefacts du job
+lint-backend:
+  stage: lint
+  image: gradle:8.7-jdk17
+  <<: *gradle-cache
+  script:
+    - cd back
+    # spotbugsMain  → analyse le code de production (src/main)
+    # spotbugsTest  → analyse également le code de test (src/test)
+    - ./gradlew spotbugsMain spotbugsTest --no-daemon
+  artifacts:
+    name: "spotbugs-$CI_COMMIT_SHORT_SHA"
+    when: always
+    expire_in: 7 days
+    paths:
+      - back/build/reports/spotbugs/
+  allow_failure: false
+
+# ==============================================================================
+# STAGE 2 — TEST
+# Tests unitaires avec rapports de couverture pour les deux composants
+# ==============================================================================
+
+# ── Tests Karma/Jasmine (Angular) ─────────────────────────────────────────────
+# Utilise Chrome Headless (--no-sandbox requis dans un conteneur Docker)
+# Génère la couverture au format Cobertura (affiché dans l'onglet "Coverage" de la MR)
+test-frontend:
+  stage: test
   image: cypress/browsers:latest
-  stage: test
+  <<: *npm-cache
   script:
     - cd front
-    - npm ci
-    - CHROME_BIN=/opt/google/chrome/chrome npx @angular/cli test --no-watch --no-progress --browsers=ChromeHeadlessNoSandbox
+    - npm ci --prefer-offline --quiet
+    # --code-coverage : active la couverture via karma-coverage
+    # --no-watch       : mode CI (pas de watch continu)
+    # --browsers       : ChromeHeadlessNoSandbox défini dans karma.conf.js
+    - |
+      CHROME_BIN=/opt/google/chrome/chrome npx @angular/cli test \
+        --no-watch \
+        --no-progress \
+        --browsers=ChromeHeadlessNoSandbox \
+        --code-coverage
+  # Regex extraite du rapport text-summary de karma-coverage
+  coverage: '/Lines\s*:\s*(\d+(?:\.\d+)?)%/'
+  artifacts:
+    name: "coverage-frontend-$CI_COMMIT_SHORT_SHA"
+    when: always
+    expire_in: 30 days
+    paths:
+      - front/coverage/
+    reports:
+      # Affiche la couverture par fichier dans l'interface GitLab MR
+      coverage_report:
+        coverage_format: cobertura
+        path: front/coverage/microcrm/cobertura-coverage.xml
+  allow_failure: false
 
-test-back:
-  image: gradle:jdk17
+# ── Tests JUnit 5 (Spring Boot) + JaCoCo ────────────────────────────────────
+# JaCoCo génère le rapport de couverture en XML (lu par GitLab) et en HTML
+test-backend:
   stage: test
+  image: gradle:8.7-jdk17
+  <<: *gradle-cache
   script:
     - cd back
-    - ./gradlew test
+    # test             → exécute les tests JUnit 5
+    # jacocoTestReport → génère le rapport de couverture XML + HTML
+    - ./gradlew test jacocoTestReport --no-daemon
+  # Regex extraite du rapport JaCoCo console (ligne "Total: XX%")
+  coverage: '/Total.*?(\d+(?:\.\d+)?)%/'
+  artifacts:
+    name: "test-backend-$CI_COMMIT_SHORT_SHA"
+    when: always
+    expire_in: 30 days
+    paths:
+      - back/build/reports/tests/
+      - back/build/reports/jacoco/
+    reports:
+      # Rapport JUnit XML — affiché dans l'onglet "Tests" de la MR GitLab
+      junit: back/build/test-results/test/*.xml
+  allow_failure: false
 
-build-front:
-  image: node
-  stage: build
-  script:
-    - cd front
-    - npm ci
-    - npx @angular/cli build --optimization
+# ==============================================================================
+# STAGE 3 — BUILD
+# Construction des 3 images Docker avec tag sémantique
+# Les images sont poussées vers le registry GitLab AVANT le scan (tag SHA uniquement)
+# Le tag :latest est appliqué après validation par Trivy (stage publish)
+# ==============================================================================
 
-build-back:
-  image: gradle:jdk17
+build-images:
   stage: build
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    # ── Calcul du tag sémantique ──────────────────────────────────────────────
+    # Règle : si le pipeline est déclenché par un git tag (ex: v1.2.3),
+    #         utiliser ce tag. Sinon, utiliser le SHA court du commit.
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        BUILD_TAG="$CI_COMMIT_TAG"
+      else
+        BUILD_TAG="$CI_COMMIT_SHORT_SHA"
+      fi
+      echo "BUILD_TAG=${BUILD_TAG}" > build.env
+      echo "Tag des images : ${BUILD_TAG}"
   script:
-    - cd back
-    - ./gradlew build
+    - source build.env
+
+    # Labels OCI standard (traçabilité de l'image vers le commit source)
+    - LABELS="--label org.opencontainers.image.revision=${CI_COMMIT_SHA} --label org.opencontainers.image.source=${CI_PROJECT_URL} --label org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    # ── Image FRONTEND : Caddy + dist Angular compilé ─────────────────────────
+    - echo "==> Build image frontend..."
+    - docker build --target front $LABELS --tag "${IMAGE_PREFIX}/frontend:${BUILD_TAG}" .
+    - docker push "${IMAGE_PREFIX}/frontend:${BUILD_TAG}"
+
+    # ── Image BACKEND : JRE Alpine + JAR Spring Boot ──────────────────────────
+    - echo "==> Build image backend..."
+    - docker build --target back $LABELS --tag "${IMAGE_PREFIX}/backend:${BUILD_TAG}" .
+    - docker push "${IMAGE_PREFIX}/backend:${BUILD_TAG}"
+
+    # ── Image STANDALONE : tout-en-un (Supervisor + frontend + backend) ───────
+    - echo "==> Build image standalone..."
+    - docker build --target standalone $LABELS --tag "${IMAGE_PREFIX}/standalone:${BUILD_TAG}" .
+    - docker push "${IMAGE_PREFIX}/standalone:${BUILD_TAG}"
+
+  artifacts:
+    # Le fichier build.env partage $BUILD_TAG avec les stages suivants
+    # via la directive "needs: [{artifacts: true}]"
+    reports:
+      dotenv: build.env
+    expire_in: 1 day
+
+# ==============================================================================
+# STAGE 4 — SCAN
+# Analyse CVE des images Docker avec Trivy (aquasecurity)
+#
+# Comportement :
+#   - Génère un rapport JSON complet (HIGH + CRITICAL) conservé en artefact
+#   - BLOQUE le pipeline (exit-code 1) si au moins une CVE CRITIQUE est trouvée
+#   - Les 3 images sont scannées en parallèle
+# ==============================================================================
+
+# ── Scan image frontend ───────────────────────────────────────────────────────
+scan-frontend:
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  cache:
+    key: trivy-db-cache
+    paths:
+      - .trivy-cache/
+  needs:
+    - job: build-images
+      artifacts: true   # Récupère $BUILD_TAG depuis build.env
+  script:
+    - IMAGE="${IMAGE_PREFIX}/frontend:${BUILD_TAG}"
+    - echo "==> Scan CVE de ${IMAGE}..."
+    # Rapport complet (HIGH + CRITICAL) pour visibilité dans les artefacts
+    - |
+      trivy image \
+        --cache-dir "$TRIVY_CACHE_DIR" \
+        --exit-code 0 \
+        --severity HIGH,CRITICAL \
+        --no-progress \
+        --format json \
+        --output trivy-frontend.json \
+        --username "$CI_REGISTRY_USER" \
+        --password "$CI_REGISTRY_PASSWORD" \
+        "$IMAGE"
+    # Seconde passe : bloque uniquement sur CRITIQUE
+    - |
+      trivy image \
+        --cache-dir "$TRIVY_CACHE_DIR" \
+        --exit-code 1 \
+        --severity CRITICAL \
+        --no-progress \
+        --username "$CI_REGISTRY_USER" \
+        --password "$CI_REGISTRY_PASSWORD" \
+        "$IMAGE"
+  artifacts:
+    name: "trivy-frontend-$CI_COMMIT_SHORT_SHA"
+    when: always
+    expire_in: 30 days
+    paths:
+      - trivy-frontend.json
+    reports:
+      container_scanning: trivy-frontend.json
+  allow_failure: false
+
+# ── Scan image backend ────────────────────────────────────────────────────────
+scan-backend:
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  cache:
+    key: trivy-db-cache
+    paths:
+      - .trivy-cache/
+  needs:
+    - job: build-images
+      artifacts: true
+  script:
+    - IMAGE="${IMAGE_PREFIX}/backend:${BUILD_TAG}"
+    - echo "==> Scan CVE de ${IMAGE}..."
+    - |
+      trivy image \
+        --cache-dir "$TRIVY_CACHE_DIR" \
+        --exit-code 0 \
+        --severity HIGH,CRITICAL \
+        --no-progress \
+        --format json \
+        --output trivy-backend.json \
+        --username "$CI_REGISTRY_USER" \
+        --password "$CI_REGISTRY_PASSWORD" \
+        "$IMAGE"
+    - |
+      trivy image \
+        --cache-dir "$TRIVY_CACHE_DIR" \
+        --exit-code 1 \
+        --severity CRITICAL \
+        --no-progress \
+        --username "$CI_REGISTRY_USER" \
+        --password "$CI_REGISTRY_PASSWORD" \
+        "$IMAGE"
+  artifacts:
+    name: "trivy-backend-$CI_COMMIT_SHORT_SHA"
+    when: always
+    expire_in: 30 days
+    paths:
+      - trivy-backend.json
+    reports:
+      container_scanning: trivy-backend.json
+  allow_failure: false
+
+# ── Scan image standalone ─────────────────────────────────────────────────────
+scan-standalone:
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  cache:
+    key: trivy-db-cache
+    paths:
+      - .trivy-cache/
+  needs:
+    - job: build-images
+      artifacts: true
+  script:
+    - IMAGE="${IMAGE_PREFIX}/standalone:${BUILD_TAG}"
+    - echo "==> Scan CVE de ${IMAGE}..."
+    - |
+      trivy image \
+        --cache-dir "$TRIVY_CACHE_DIR" \
+        --exit-code 0 \
+        --severity HIGH,CRITICAL \
+        --no-progress \
+        --format json \
+        --output trivy-standalone.json \
+        --username "$CI_REGISTRY_USER" \
+        --password "$CI_REGISTRY_PASSWORD" \
+        "$IMAGE"
+    - |
+      trivy image \
+        --cache-dir "$TRIVY_CACHE_DIR" \
+        --exit-code 1 \
+        --severity CRITICAL \
+        --no-progress \
+        --username "$CI_REGISTRY_USER" \
+        --password "$CI_REGISTRY_PASSWORD" \
+        "$IMAGE"
+  artifacts:
+    name: "trivy-standalone-$CI_COMMIT_SHORT_SHA"
+    when: always
+    expire_in: 30 days
+    paths:
+      - trivy-standalone.json
+    reports:
+      container_scanning: trivy-standalone.json
+  allow_failure: false
+
+# ==============================================================================
+# STAGE 5 — PUBLISH
+# Tagage :latest et publication finale dans le registry GitLab
+# Déclenché seulement si les 3 scans Trivy ont passé sans CVE CRITIQUE
+# Conditions : branche principale (main/master) OU git tag semver
+# ==============================================================================
+
+publish-images:
+  stage: publish
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+  needs:
+    - job: scan-frontend        # Attend la validation sécurité frontend
+    - job: scan-backend         # Attend la validation sécurité backend
+    - job: scan-standalone      # Attend la validation sécurité standalone
+    - job: build-images
+      artifacts: true           # Récupère $BUILD_TAG
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - |
+      for IMAGE in frontend backend standalone; do
+        FULL="${IMAGE_PREFIX}/${IMAGE}"
+
+        # Pull l'image déjà construite (identifiée par son SHA)
+        docker pull "${FULL}:${BUILD_TAG}"
+
+        # Applique le tag :latest (images validées par scan)
+        docker tag  "${FULL}:${BUILD_TAG}" "${FULL}:latest"
+        docker push "${FULL}:latest"
+        echo "Publié : ${FULL}:latest"
+
+        # Si pipeline déclenché par un git tag (ex: v1.2.3), publier aussi ce tag
+        if [ -n "$CI_COMMIT_TAG" ]; then
+          docker tag  "${FULL}:${BUILD_TAG}" "${FULL}:${CI_COMMIT_TAG}"
+          docker push "${FULL}:${CI_COMMIT_TAG}"
+          echo "Publié : ${FULL}:${CI_COMMIT_TAG}"
+        fi
+      done
+  rules:
+    # Publier uniquement sur la branche principale ou lors d'un tag git
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_TAG != null'
+
+# ==============================================================================
+# STAGE 6 — DEPLOY (optionnel)
+# Déploiement automatique sur le serveur de staging via SSH + Docker Compose
+#
+# Prérequis sur le serveur de staging :
+#   - Docker + Docker Compose installés
+#   - Répertoire /opt/orion-ucrm avec docker-compose.staging.yml présent
+#   - Clé SSH publique du pipeline ajoutée dans ~/.ssh/authorized_keys
+#
+# Variables GitLab CI à configurer (Settings → CI/CD → Variables) :
+#   STAGING_SSH_PRIVATE_KEY  → Clé SSH privée (type: File, Masked+Protected)
+#   STAGING_SSH_KNOWN_HOSTS  → `ssh-keyscan <STAGING_HOST>` (Masked+Protected)
+#   STAGING_USER             → ex: deploy
+#   STAGING_HOST             → ex: staging.monentreprise.com
+# ==============================================================================
+
+deploy-staging:
+  stage: deploy
+  image: alpine:3.19
+  needs:
+    - job: publish-images       # Attend que les images :latest soient publiées
+    - job: build-images
+      artifacts: true           # Récupère $BUILD_TAG pour le log
+  before_script:
+    - apk add --no-cache openssh-client bash
+    - eval $(ssh-agent -s)
+    # Charge la clé SSH privée depuis la variable CI/CD protégée
+    - echo "$STAGING_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$STAGING_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    # Passe les variables nécessaires au serveur via stdin SSH (évite les injections)
+    - |
+      ssh "$STAGING_USER@$STAGING_HOST" \
+        REGISTRY_IMAGE="$IMAGE_PREFIX" \
+        IMAGE_TAG="$BUILD_TAG" \
+        CI_REGISTRY="$CI_REGISTRY" \
+        CI_REGISTRY_USER="$CI_REGISTRY_USER" \
+        CI_REGISTRY_PASSWORD="$CI_REGISTRY_PASSWORD" \
+        bash << 'REMOTE_SCRIPT'
+          set -e
+          echo "==> Déploiement orion-ucrm tag=${IMAGE_TAG} sur staging..."
+          cd /opt/orion-ucrm
+
+          # Authentification au registry GitLab depuis le serveur de staging
+          echo "$CI_REGISTRY_PASSWORD" | \
+            docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+          # Pull des nouvelles images + redémarrage sans interruption
+          docker compose -f docker-compose.staging.yml pull
+          docker compose -f docker-compose.staging.yml up -d --remove-orphans
+
+          # Nettoyage des anciennes images pour libérer de l'espace disque
+          docker image prune -f
+
+          echo "==> Déploiement terminé. Conteneurs actifs :"
+          docker compose -f docker-compose.staging.yml ps
+      REMOTE_SCRIPT
+  environment:
+    name: staging
+    url: http://$STAGING_HOST
+  rules:
+    # Déployer uniquement sur la branche principale et si le publish a réussi
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: on_success

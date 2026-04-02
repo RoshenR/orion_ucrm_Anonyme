@@ -1,0 +1,351 @@
+# ==============================================================================
+# PIPELINE CI/CD DEVSECOPS — ORION UCRM
+# GitHub Actions + GitHub Container Registry (GHCR)
+# ==============================================================================
+# Aucun secret à configurer — GITHUB_TOKEN est automatique.
+# Un seul réglage requis : Settings → Actions → General
+#                          → Workflow permissions → Read and write permissions
+# ==============================================================================
+
+name: CI/CD DevSecOps
+
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  checks: write
+  pull-requests: write
+
+jobs:
+
+  # ============================================================================
+  # LINT — Analyse statique du code
+  # ============================================================================
+
+  lint-frontend:
+    name: "Lint — ESLint Angular"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: front/package-lock.json
+      - run: npm ci --prefer-offline --quiet
+        working-directory: front
+      - run: npx ng lint --format=compact
+        working-directory: front
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eslint-report
+          path: front/eslint-report.txt
+          retention-days: 7
+
+  lint-backend:
+    name: "Lint — SpotBugs Java"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+      - run: ./gradlew spotbugsMain spotbugsTest --no-daemon
+        working-directory: back
+        env:
+          GRADLE_OPTS: -Dorg.gradle.daemon=false
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spotbugs-report
+          path: back/build/reports/spotbugs/
+          retention-days: 7
+
+  # ============================================================================
+  # TEST — Tests unitaires + couverture de code
+  # ============================================================================
+
+  test-frontend:
+    name: "Tests — Karma/Jasmine (Angular)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: front/package-lock.json
+      - run: npm ci --prefer-offline --quiet
+        working-directory: front
+      - name: Tests avec couverture
+        run: |
+          npx @angular/cli test \
+            --no-watch \
+            --no-progress \
+            --browsers=ChromeHeadlessNoSandbox \
+            --code-coverage
+        working-directory: front
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-frontend
+          path: front/coverage/
+          retention-days: 30
+
+  test-backend:
+    name: "Tests — JUnit 5 + JaCoCo (Spring Boot)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+      - name: Tests avec JaCoCo
+        run: ./gradlew test jacocoTestReport --no-daemon
+        working-directory: back
+        env:
+          GRADLE_OPTS: -Dorg.gradle.daemon=false
+      - name: Publier résultats JUnit dans la PR
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: back/build/test-results/test/*.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-backend-reports
+          path: |
+            back/build/reports/tests/
+            back/build/reports/jacoco/
+          retention-days: 30
+
+  # ============================================================================
+  # BUILD — Construction des 3 images Docker → push vers GHCR avec tag SHA
+  # ============================================================================
+
+  build-images:
+    name: "Build — Images Docker"
+    runs-on: ubuntu-latest
+    needs: [lint-frontend, lint-backend, test-frontend, test-backend]
+    outputs:
+      image_tag: ${{ steps.set-tag.outputs.image_tag }}
+      image_prefix: ${{ steps.set-prefix.outputs.image_prefix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculer le préfixe (lowercase obligatoire pour GHCR)
+        id: set-prefix
+        run: echo "image_prefix=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Calculer le tag (SHA court ou tag git)
+        id: set-tag
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "image_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Build & push — frontend"
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: front
+          push: true
+          tags: ${{ steps.set-prefix.outputs.image_prefix }}/frontend:${{ steps.set-tag.outputs.image_tag }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+      - name: "Build & push — backend"
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: back
+          push: true
+          tags: ${{ steps.set-prefix.outputs.image_prefix }}/backend:${{ steps.set-tag.outputs.image_tag }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: "Build & push — standalone"
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: standalone
+          push: true
+          tags: ${{ steps.set-prefix.outputs.image_prefix }}/standalone:${{ steps.set-tag.outputs.image_tag }}
+          cache-from: type=gha,scope=standalone
+          cache-to: type=gha,mode=max,scope=standalone
+
+  # ============================================================================
+  # SCAN — Trivy analyse les 3 images en parallèle
+  # Pipeline bloqué si CVE CRITIQUE détectée
+  # ============================================================================
+
+  scan-frontend:
+    name: "Scan CVE — frontend"
+    runs-on: ubuntu-latest
+    needs: build-images
+    steps:
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rapport complet HIGH + CRITICAL
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-images.outputs.image_prefix }}/frontend:${{ needs.build-images.outputs.image_tag }}
+          format: sarif
+          output: trivy-frontend.sarif
+          severity: HIGH,CRITICAL
+          exit-code: '0'
+
+      - name: Upload résultats → onglet Security GitHub
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-frontend.sarif
+          category: trivy-frontend
+
+      - name: BLOQUER si CVE CRITIQUE
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-images.outputs.image_prefix }}/frontend:${{ needs.build-images.outputs.image_tag }}
+          format: table
+          severity: CRITICAL
+          exit-code: '1'
+
+  scan-backend:
+    name: "Scan CVE — backend"
+    runs-on: ubuntu-latest
+    needs: build-images
+    steps:
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rapport complet HIGH + CRITICAL
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-images.outputs.image_prefix }}/backend:${{ needs.build-images.outputs.image_tag }}
+          format: sarif
+          output: trivy-backend.sarif
+          severity: HIGH,CRITICAL
+          exit-code: '0'
+
+      - name: Upload résultats → onglet Security GitHub
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-backend.sarif
+          category: trivy-backend
+
+      - name: BLOQUER si CVE CRITIQUE
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-images.outputs.image_prefix }}/backend:${{ needs.build-images.outputs.image_tag }}
+          format: table
+          severity: CRITICAL
+          exit-code: '1'
+
+  scan-standalone:
+    name: "Scan CVE — standalone"
+    runs-on: ubuntu-latest
+    needs: build-images
+    steps:
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rapport complet HIGH + CRITICAL
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-images.outputs.image_prefix }}/standalone:${{ needs.build-images.outputs.image_tag }}
+          format: sarif
+          output: trivy-standalone.sarif
+          severity: HIGH,CRITICAL
+          exit-code: '0'
+
+      - name: Upload résultats → onglet Security GitHub
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-standalone.sarif
+          category: trivy-standalone
+
+      - name: BLOQUER si CVE CRITIQUE
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-images.outputs.image_prefix }}/standalone:${{ needs.build-images.outputs.image_tag }}
+          format: table
+          severity: CRITICAL
+          exit-code: '1'
+
+  # ============================================================================
+  # PUBLISH — Applique :latest après validation sécurité
+  # Uniquement sur main/master ou git tag
+  # ============================================================================
+
+  publish-images:
+    name: "Publish — Tag :latest"
+    runs-on: ubuntu-latest
+    needs: [scan-frontend, scan-backend, scan-standalone, build-images]
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/master' ||
+      startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Appliquer tag :latest (et semver si git tag)
+        env:
+          IMAGE_PREFIX: ${{ needs.build-images.outputs.image_prefix }}
+          IMAGE_TAG: ${{ needs.build-images.outputs.image_tag }}
+        run: |
+          for IMAGE in frontend backend standalone; do
+            FULL="${IMAGE_PREFIX}/${IMAGE}"
+            docker pull "${FULL}:${IMAGE_TAG}"
+            docker tag  "${FULL}:${IMAGE_TAG}" "${FULL}:latest"
+            docker push "${FULL}:latest"
+            echo "Publié : ${FULL}:latest"
+            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+              docker tag  "${FULL}:${IMAGE_TAG}" "${FULL}:${GITHUB_REF_NAME}"
+              docker push "${FULL}:${GITHUB_REF_NAME}"
+              echo "Publié : ${FULL}:${GITHUB_REF_NAME}"
+            fi
+          done
