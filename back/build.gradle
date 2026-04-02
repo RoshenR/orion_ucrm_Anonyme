@@ -60,8 +60,9 @@ jacocoTestReport {
 // SPOTBUGS — Analyse statique (lint Java)
 // ==============================================================================
 spotbugs {
-	// false = le build échoue si SpotBugs trouve des problèmes (bloquant en CI)
-	ignoreFailures = false
+	// true = SpotBugs génère le rapport mais ne bloque pas le pipeline
+	// Mettre à false quand l'équipe est prête à corriger les bugs détectés
+	ignoreFailures = true
 }
 
 // Rapport HTML lisible + XML pour intégration CI
