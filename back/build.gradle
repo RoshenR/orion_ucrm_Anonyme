@@ -62,12 +62,6 @@ jacocoTestReport {
 spotbugs {
 	// false = le build échoue si SpotBugs trouve des problèmes (bloquant en CI)
 	ignoreFailures = false
-	// Niveau d'effort : max = analyse la plus approfondie
-	effort = 'default'
-	// Niveau de confiance des rapports : MEDIUM = signale les vrais problèmes
-	reportLevel = 'medium'
-	// Exclure les faux positifs connus (à créer si nécessaire)
-	// excludeFilter = file("spotbugs-exclude.xml")
 }
 
 // Rapport HTML lisible + XML pour intégration CI
